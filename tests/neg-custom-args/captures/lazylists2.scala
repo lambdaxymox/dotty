@@ -37,7 +37,7 @@ extension [A](xs: {*} LazyList[A])
       this: ({xs} Mapped) =>
 
       def isEmpty = false
-      def head: B = f(xs.head)
+      def head: B = f(xs.head)  // error
       def tail: {this} LazyList[B] = xs.tail.map(f) // error
     new Mapped
 
@@ -56,8 +56,8 @@ extension [A](xs: {*} LazyList[A])
 
       def isEmpty = false
       def head: B = f(xs.head)
-      def tail: {this} LazyList[B] = xs.tail.map(f) // error
-    class Mapped2 extends Mapped:
+      def tail: {this} LazyList[B] = xs.tail.map(f)
+    class Mapped2 extends Mapped:  // error
       this: Mapped =>
     new Mapped2
 

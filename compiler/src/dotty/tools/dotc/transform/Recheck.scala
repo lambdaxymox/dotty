@@ -7,7 +7,7 @@ import Symbols.*, Contexts.*, Types.*, ContextOps.*, Decorators.*, SymDenotation
 import Flags.*, SymUtils.*, NameKinds.*
 import ast.*
 import Phases.Phase
-import DenotTransformers.{IdentityDenotTransformer, DenotTransformer}
+import DenotTransformers.{DenotTransformer, IdentityDenotTransformer, SymTransformer}
 import NamerOps.{methodType, linkConstructorParams}
 import NullOpsDecorator.stripNull
 import typer.ErrorReporting.err
@@ -22,10 +22,18 @@ import reporting.trace
 
 object Recheck:
 
+  /** A flag used to indicate that a ParamAccessor has been temporily made not-private
+   *  Only used at the start of the Recheck phase, reset at its end.
+   *  The flag repurposes the Scala2ModuleVar flag. No confusion is possible since
+   *  Scala2ModuleVar cannot be also ParamAccessors.
+   */
+  val ResetPrivate = Scala2ModuleVar
+  val ResetPrivateParamAccessor = ResetPrivate | ParamAccessor
+
   import tpd.Tree
 
   /** Attachment key for rechecked types of TypeTrees */
-  private val RecheckedType = Property.Key[Type]
+  val RecheckedType = Property.Key[Type]
 
   extension (sym: Symbol)
 
@@ -34,7 +42,12 @@ object Recheck:
      */
     def updateInfoBetween(prevPhase: DenotTransformer, lastPhase: DenotTransformer, newInfo: Type)(using Context): Unit =
       if sym.info ne newInfo then
-        sym.copySymDenotation().installAfter(lastPhase) // reset
+        sym.copySymDenotation(
+            initFlags =
+              if sym.flags.isAllOf(ResetPrivateParamAccessor)
+              then sym.flags &~ ResetPrivate | Private
+              else sym.flags
+          ).installAfter(lastPhase) // reset
         sym.copySymDenotation(
             info = newInfo,
             initFlags =
@@ -52,11 +65,16 @@ object Recheck:
   extension (tree: Tree)
 
     /** Remember `tpe` as the type of `tree`, which might be different from the
-     *  type stored in the tree itself.
+     *  type stored in the tree itself, unless a type was already remembered for `tree`.
      */
     def rememberType(tpe: Type)(using Context): Unit =
-      if (tpe ne tree.tpe) && !tree.hasAttachment(RecheckedType) then
-        tree.putAttachment(RecheckedType, tpe)
+      if !tree.hasAttachment(RecheckedType) then rememberTypeAlways(tpe)
+
+    /** Remember `tpe` as the type of `tree`, which might be different from the
+     *  type stored in the tree itself
+     */
+    def rememberTypeAlways(tpe: Type)(using Context): Unit =
+      if tpe ne tree.tpe then tree.putAttachment(RecheckedType, tpe)
 
     /** The remembered type of the tree, or if none was installed, the original type */
     def knownType =
@@ -64,7 +82,7 @@ object Recheck:
 
     def hasRememberedType: Boolean = tree.hasAttachment(RecheckedType)
 
-abstract class Recheck extends Phase, IdentityDenotTransformer:
+abstract class Recheck extends Phase, SymTransformer:
   thisPhase =>
 
   import ast.tpd.*
@@ -80,6 +98,12 @@ abstract class Recheck extends Phase, IdentityDenotTransformer:
     // One failing test is pos/i583a.scala
 
   override def widenSkolems = true
+
+  /** Change any `ResetPrivate` flags back to `Private` */
+  def transformSym(sym: SymDenotation)(using Context): SymDenotation =
+    if sym.isAllOf(Recheck.ResetPrivateParamAccessor) then
+      sym.copySymDenotation(initFlags = sym.flags &~ Recheck.ResetPrivate | Private)
+    else sym
 
   def run(using Context): Unit =
     newRechecker().checkUnit(ctx.compilationUnit)
@@ -126,15 +150,12 @@ abstract class Recheck extends Phase, IdentityDenotTransformer:
         bindType
 
     def recheckValDef(tree: ValDef, sym: Symbol)(using Context): Unit =
-      if !tree.rhs.isEmpty then recheckRHS(tree.rhs, sym.info, sym)
+      if !tree.rhs.isEmpty then recheck(tree.rhs, sym.info)
 
     def recheckDefDef(tree: DefDef, sym: Symbol)(using Context): Unit =
       val rhsCtx = linkConstructorParams(sym).withOwner(sym)
       if !tree.rhs.isEmpty && !sym.isInlineMethod && !sym.isEffectivelyErased then
-        inContext(rhsCtx) { recheckRHS(tree.rhs, recheck(tree.tpt), sym) }
-
-    def recheckRHS(tree: Tree, pt: Type, sym: Symbol)(using Context): Type =
-      recheck(tree, pt)
+        inContext(rhsCtx) { recheck(tree.rhs, recheck(tree.tpt)) }
 
     def recheckTypeDef(tree: TypeDef, sym: Symbol)(using Context): Type =
       recheck(tree.rhs)
@@ -329,6 +350,7 @@ abstract class Recheck extends Phase, IdentityDenotTransformer:
         case tree: Alternative => recheckAlternative(tree, pt)
         case tree: PackageDef => recheckPackageDef(tree)
         case tree: Thicket => defn.NothingType
+        case tree: Import => defn.NothingType
 
       tree match
         case tree: NameTree => recheckNamed(tree, pt)
@@ -357,21 +379,22 @@ abstract class Recheck extends Phase, IdentityDenotTransformer:
         // Don't report closure nodes, since their span is a point; wait instead
         // for enclosing block to preduce an error
       case _ =>
-        val actual = tpe.widenExpr
-        val expected = pt.widenExpr
-        //println(i"check conforms $actual <:< $expected")
-        val isCompatible =
-          actual <:< expected
-          || expected.isRepeatedParam
-             && actual <:< expected.translateFromRepeated(toArray = tree.tpe.isRef(defn.ArrayClass))
-        if !isCompatible then
-          recheckr.println(i"conforms failed for ${tree}: $tpe vs $expected")
-          err.typeMismatch(tree.withType(tpe), expected)
-        else if debugSuccesses then
-          tree match
-            case _: Ident =>
-              println(i"SUCCESS $tree:\n${TypeComparer.explained(_.isSubType(actual, expected))}")
-            case _ =>
+        checkConformsExpr(tpe, tpe.widenExpr, pt.widenExpr, tree)
+
+    def checkConformsExpr(original: Type, actual: Type, expected: Type, tree: Tree)(using Context): Unit =
+      //println(i"check conforms $actual <:< $expected")
+      val isCompatible =
+        actual <:< expected
+        || expected.isRepeatedParam
+            && actual <:< expected.translateFromRepeated(toArray = tree.tpe.isRef(defn.ArrayClass))
+      if !isCompatible then
+        recheckr.println(i"conforms failed for ${tree}: $original vs $expected")
+        err.typeMismatch(tree.withType(original), expected)
+      else if debugSuccesses then
+        tree match
+          case _: Ident =>
+            println(i"SUCCESS $tree:\n${TypeComparer.explained(_.isSubType(actual, expected))}")
+          case _ =>
 
     def checkUnit(unit: CompilationUnit)(using Context): Unit =
       recheck(unit.tpdTree)
@@ -389,6 +412,9 @@ abstract class Recheck extends Phase, IdentityDenotTransformer:
       super.show(addRecheckedTypes.transform(tree.asInstanceOf[tpd.Tree]))
     }
 end Recheck
+
+object TestRecheck:
+  class Pre extends PreRecheck, IdentityDenotTransformer
 
 class TestRecheck extends Recheck:
   def phaseName: String = "recheck"

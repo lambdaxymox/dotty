@@ -104,7 +104,7 @@ sealed abstract class CaptureSet extends Showable:
   extension (x: CaptureRef) private def subsumes(y: CaptureRef) =
     (x eq y)
     || y.match
-        case y: TermRef => y.prefix eq x // ^^^ y.prefix.subsumes(x) ?
+        case y: TermRef => y.prefix eq x
         case _ => false
 
   /** {x} <:< this   where <:< is subcapturing, but treating all variables
@@ -172,6 +172,10 @@ sealed abstract class CaptureSet extends Showable:
   def - (ref: CaptureRef)(using Context): CaptureSet =
     this -- ref.singletonCaptureSet
 
+  def disallowRootCapability(handler: () => Unit)(using Context): this.type =
+    if isUniversal then handler()
+    this
+
   def filter(p: CaptureRef => Boolean)(using Context): CaptureSet =
     if this.isConst then
       val elems1 = elems.filter(p)
@@ -211,6 +215,12 @@ sealed abstract class CaptureSet extends Showable:
 
   protected def propagateSolved()(using Context): Unit = ()
 
+  /** This capture set with a description that tells where it comes from */
+  def withDescription(description: String): CaptureSet
+
+  /** The provided description (using `withDescription`) for this capture set or else "" */
+  def description: String
+
   def toRetainsTypeArg(using Context): Type =
     assert(isConst)
     ((NoType: Type) /: elems) ((tp, ref) =>
@@ -221,7 +231,7 @@ sealed abstract class CaptureSet extends Showable:
     Annotation(CaptureAnnotation(this, kind).tree)
 
   override def toText(printer: Printer): Text =
-    Str("{") ~ Text(elems.toList.map(printer.toTextCaptureRef), ", ") ~ Str("}")
+    Str("{") ~ Text(elems.toList.map(printer.toTextCaptureRef), ", ") ~ Str("}") ~~ description
 
 object CaptureSet:
   type Refs = SimpleIdentitySet[CaptureRef]
@@ -250,7 +260,7 @@ object CaptureSet:
   def apply(elems: Refs)(using Context): CaptureSet.Const =
     if elems.isEmpty then empty else Const(elems)
 
-  class Const private[CaptureSet] (val elems: Refs) extends CaptureSet:
+  class Const private[CaptureSet] (val elems: Refs, val description: String = "") extends CaptureSet:
     assert(elems != null)
     def isConst = true
     def isAlwaysEmpty = elems.isEmpty
@@ -261,6 +271,8 @@ object CaptureSet:
     def addSuper(cs: CaptureSet)(using Context, VarState) = CompareResult.OK
 
     def upperApprox(origin: CaptureSet)(using Context): CaptureSet = this
+
+    def withDescription(description: String): Const = Const(elems, description)
 
     override def toString = elems.toString
   end Const
@@ -276,6 +288,9 @@ object CaptureSet:
     var deps: Deps = emptySet
     def isConst = isSolved
     def isAlwaysEmpty = false
+    var addRootHandler: () => Unit = () => ()
+
+    var description: String = ""
 
     private def recordElemsState()(using VarState): Boolean =
       varState.getElems(this) match
@@ -296,6 +311,7 @@ object CaptureSet:
     def addNewElems(newElems: Refs, origin: CaptureSet)(using Context, VarState): CompareResult =
       if !isConst && recordElemsState() then
         elems ++= newElems
+        if isUniversal then addRootHandler()
         // assert(id != 2 || elems.size != 2, this)
         (CompareResult.OK /: deps) { (r, dep) =>
           r.andAlso(dep.tryInclude(newElems, this))
@@ -312,6 +328,10 @@ object CaptureSet:
       else
         CompareResult.fail(this)
 
+    override def disallowRootCapability(handler: () => Unit)(using Context): this.type =
+      addRootHandler = handler
+      super.disallowRootCapability(handler)
+
     private var computingApprox = false
 
     final def upperApprox(origin: CaptureSet)(using Context): CaptureSet =
@@ -322,17 +342,25 @@ object CaptureSet:
         try computeApprox(origin).ensuring(_.isConst)
         finally computingApprox = false
 
+    def withDescription(description: String): this.type =
+      this.description =
+        if this.description.isEmpty then description
+        else s"${this.description} and $description"
+      this
+
     protected def computeApprox(origin: CaptureSet)(using Context): CaptureSet =
       (universal /: deps) { (acc, sup) => acc ** sup.upperApprox(this) }
 
-    def solve(variance: Int)(using Context): Unit =
-      if variance < 0 && !isConst then
+    /** Widen the variable's elements to its upper approximation and
+     *  mark it as constant from now on.
+     */
+    def solve()(using Context): Unit =
+      if !isConst then
         val approx = upperApprox(empty)
         //println(i"solving var $this $approx ${approx.isConst} deps = ${deps.toList}")
-        if approx.isConst then
-          val newElems = approx.elems -- elems
-          if newElems.isEmpty || addNewElems(newElems, empty)(using ctx, VarState()).isOK then
-            markSolved()
+        val newElems = approx.elems -- elems
+        if newElems.isEmpty || addNewElems(newElems, empty)(using ctx, VarState()).isOK then
+          markSolved()
 
     def markSolved()(using Context): Unit =
       isSolved = true
@@ -529,12 +557,8 @@ object CaptureSet:
         yield captureSetOf(arg)
       css.foldLeft(empty)(_ ++ _)
     */
+
   def ofInfo(ref: CaptureRef)(using Context): CaptureSet = ref match
-    case ref: ThisType =>
-      val declaredCaptures = ref.cls.givenSelfType.captureSet
-      ref.cls.paramAccessors.foldLeft(declaredCaptures) ((cs, acc) =>
-        cs ++ acc.termRef.captureSetOfInfo) // ^^^ need to also include outer references of inner classes
-        .showing(i"cc info $ref with ${ref.cls.paramAccessors.map(_.termRef)}%, % = $result", capt)
     case ref: TermRef if ref.isRootCapability => ref.singletonCaptureSet
     case _ => ofType(ref.underlying)
 
